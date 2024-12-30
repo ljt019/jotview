@@ -1,0 +1,23 @@
+[package]
+name = "jotview"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# For the terminal UI
+ratatui = "0.29"  # Ensure compatibility with latest version
+
+# For handling raw mode and terminal interaction
+crossterm = "0.25"  # Works well with ratatui
+
+# For asynchronous programming and HTTP requests
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.11", features = ["json"] }
+
+# For serialization and deserialization of JSON
+serde = { version = "1.0", features = ["derive"] }
+
+# For robust error handling in validators
+serde_json = "1.0"
+
+chrono = "0.4"
