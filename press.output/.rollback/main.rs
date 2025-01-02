@@ -1,15 +1,18 @@
 use chrono::NaiveDate;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
-    prelude::{Buffer, StatefulWidget},
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::Span,
     widgets::{
-        Block, Borders, Cell, Padding, Paragraph, Row, Scrollbar, ScrollbarState, Table, Widget,
-        Wrap,
+        Block, Borders, Cell, Padding, Paragraph, Row, Scrollbar, ScrollbarState, Table, Wrap,
     },
-    DefaultTerminal, Frame,
+    Frame, Terminal,
 };
 use serde::{Deserialize, Serialize};
 use std::{error::Error, io};
@@ -50,132 +53,56 @@ struct App {
 }
 
 impl App {
-    async fn setup_initial_state(&mut self) -> Result<(), Box<dyn Error>> {
-        self.jotforms = fetch_jotforms().await?;
-        if let Some(first_jotform) = self.jotforms.first() {
-            self.selected_id = first_jotform.id.clone();
-        }
-        Ok(())
+    async fn new() -> Result<Self, Box<dyn Error>> {
+        let mut jotforms = fetch_jotforms().await?;
+        jotforms.sort_by(|a, b| {
+            let status_order = match (a.status.as_str(), b.status.as_str()) {
+                ("InProgress", _) => std::cmp::Ordering::Less,
+                (_, "InProgress") => std::cmp::Ordering::Greater,
+                ("Unplanned", _) => std::cmp::Ordering::Greater,
+                (_, "Unplanned") => std::cmp::Ordering::Less,
+                _ => std::cmp::Ordering::Equal,
+            };
+            if status_order == std::cmp::Ordering::Equal {
+                let date_a = NaiveDate::parse_from_str(&a.created_at.date, "%Y-%m-%d").unwrap();
+                let date_b = NaiveDate::parse_from_str(&b.created_at.date, "%Y-%m-%d").unwrap();
+                date_b.cmp(&date_a)
+            } else {
+                status_order
+            }
+        });
+
+        let selected_id = jotforms.get(0).map(|j| j.id.clone()).unwrap_or_default();
+
+        Ok(Self {
+            jotforms,
+            selected_id,
+            scroll_state: ScrollbarState::default(),
+            description_offset: 0,
+            exit: false,
+        })
     }
 
-    pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
-        // Handle the Result from setup_initial_state
-        if let Err(e) = self.setup_initial_state().await {
-            eprintln!("Failed to setup initial state: {}", e);
-            return Ok(()); // or return Err(io::Error::new(io::ErrorKind::Other, e.to_string()))
-        }
+    async fn run(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+        jotforms: Vec<Jotform>,
+    ) -> Result<(), Box<dyn Error>> {
+        self.jotforms = jotforms;
 
         while !self.exit {
-            terminal.draw(|frame| self.draw(frame))?;
-            // Handle the Result from handle_events
-            if let Err(e) = self.handle_events().await {
-                eprintln!("Error handling events: {}", e);
-                break;
-            }
+            terminal.draw(|f| self.draw(f))?;
+            self.handle_events().await?;
         }
         Ok(())
     }
 
-    fn draw(&self, frame: &mut Frame) {
-        frame.render_widget(self, frame.area());
-    }
-
-    async fn handle_events(&mut self) -> io::Result<()> {
-        match event::read()? {
-            Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
-                self.handle_key_events(key_event).await;
-            }
-            _ => {}
-        };
-        Ok(())
-    }
-
-    async fn handle_key_events(&mut self, key_event: KeyEvent) {
-        match key_event.code {
-            KeyCode::Char('q') => self.exit(),
-
-            KeyCode::Up => {
-                if let Some(current_index) =
-                    self.jotforms.iter().position(|j| j.id == self.selected_id)
-                {
-                    if current_index > 0 {
-                        self.selected_id = self.jotforms[current_index - 1].id.clone();
-                        self.description_offset = 0;
-                    }
-                }
-            }
-            KeyCode::Down => {
-                if let Some(current_index) =
-                    self.jotforms.iter().position(|j| j.id == self.selected_id)
-                {
-                    if current_index < self.jotforms.len() - 1 {
-                        self.selected_id = self.jotforms[current_index + 1].id.clone();
-                        self.description_offset = 0;
-                    }
-                }
-            }
-            KeyCode::Char('e') => {
-                if let Some(selected_jotform) =
-                    self.jotforms.iter_mut().find(|j| j.id == self.selected_id)
-                {
-                    selected_jotform.status = match selected_jotform.status.as_str() {
-                        "Open" => "InProgress".to_string(),
-                        "InProgress" => "Closed".to_string(),
-                        "Closed" => "Unplanned".to_string(),
-                        "Unplanned" => "Open".to_string(),
-                        _ => "Open".to_string(),
-                    };
-                    update_status(&selected_jotform.id, &selected_jotform.status)
-                        .await
-                        .unwrap();
-                    self.jotforms.sort_by(|a, b| {
-                        let status_order = match (a.status.as_str(), b.status.as_str()) {
-                            ("InProgress", _) => std::cmp::Ordering::Less,
-                            (_, "InProgress") => std::cmp::Ordering::Greater,
-                            ("Unplanned", _) => std::cmp::Ordering::Greater,
-                            (_, "Unplanned") => std::cmp::Ordering::Less,
-                            _ => std::cmp::Ordering::Equal,
-                        };
-                        if status_order == std::cmp::Ordering::Equal {
-                            let date_a =
-                                NaiveDate::parse_from_str(&a.created_at.date, "%Y-%m-%d").unwrap();
-                            let date_b =
-                                NaiveDate::parse_from_str(&b.created_at.date, "%Y-%m-%d").unwrap();
-                            date_b.cmp(&date_a)
-                        } else {
-                            status_order
-                        }
-                    });
-                    if let Some(new_index) =
-                        self.jotforms.iter().position(|j| j.id == self.selected_id)
-                    {
-                        self.selected_id = self.jotforms[new_index].id.clone();
-                    }
-                }
-            }
-
-            KeyCode::PageUp => {
-                self.description_offset = self.description_offset.saturating_sub(1);
-            }
-            KeyCode::PageDown => {
-                self.description_offset = self.description_offset.saturating_add(1);
-            }
-
-            _ => {}
-        }
-    }
-
-    fn exit(&mut self) {
-        self.exit = true;
-    }
-}
-
-impl Widget for &App {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+    fn draw(&self, f: &mut Frame) {
+        let size = f.area();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
-            .split(area);
+            .split(size);
 
         // Render the table
         let rows = self.jotforms.iter().map(|jotform| {
@@ -275,7 +202,7 @@ impl Widget for &App {
         )
         .column_spacing(2);
 
-        Widget::render(table, chunks[0], buf);
+        f.render_widget(table, chunks[0]);
 
         let selected_jotform = self.jotforms.iter().find(|j| j.id == self.selected_id);
         let description = match selected_jotform {
@@ -304,7 +231,7 @@ impl Widget for &App {
             .wrap(Wrap { trim: false })
             .scroll((self.description_offset, 0));
 
-        desc_paragraph.render(chunks[1], buf);
+        f.render_widget(desc_paragraph, chunks[1]);
 
         let total_lines = description.lines().count();
         let visible_lines = chunks[1].height.saturating_sub(2) as usize;
@@ -319,14 +246,101 @@ impl Widget for &App {
             .orientation(ratatui::widgets::ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("↑"))
             .end_symbol(Some("↓"));
-        scrollbar.render(chunks[1], buf, &mut scroll_state.clone());
+        f.render_stateful_widget(scrollbar, chunks[1], &mut scroll_state.clone());
+    }
+
+    async fn handle_events(&mut self) -> Result<(), Box<dyn Error>> {
+        if let Event::Key(key) = event::read()? {
+            if key.kind == KeyEventKind::Press {
+                match key.code {
+                    KeyCode::Char('q') => self.exit(),
+
+                    KeyCode::Up => {
+                        if let Some(current_index) =
+                            self.jotforms.iter().position(|j| j.id == self.selected_id)
+                        {
+                            if current_index > 0 {
+                                self.selected_id = self.jotforms[current_index - 1].id.clone();
+                                self.description_offset = 0;
+                            }
+                        }
+                    }
+                    KeyCode::Down => {
+                        if let Some(current_index) =
+                            self.jotforms.iter().position(|j| j.id == self.selected_id)
+                        {
+                            if current_index < self.jotforms.len() - 1 {
+                                self.selected_id = self.jotforms[current_index + 1].id.clone();
+                                self.description_offset = 0;
+                            }
+                        }
+                    }
+                    KeyCode::Char('e') => {
+                        if let Some(selected_jotform) =
+                            self.jotforms.iter_mut().find(|j| j.id == self.selected_id)
+                        {
+                            selected_jotform.status = match selected_jotform.status.as_str() {
+                                "Open" => "InProgress".to_string(),
+                                "InProgress" => "Closed".to_string(),
+                                "Closed" => "Unplanned".to_string(),
+                                "Unplanned" => "Open".to_string(),
+                                _ => "Open".to_string(),
+                            };
+                            update_status(&selected_jotform.id, &selected_jotform.status).await?;
+                            self.jotforms.sort_by(|a, b| {
+                                let status_order = match (a.status.as_str(), b.status.as_str()) {
+                                    ("InProgress", _) => std::cmp::Ordering::Less,
+                                    (_, "InProgress") => std::cmp::Ordering::Greater,
+                                    ("Unplanned", _) => std::cmp::Ordering::Greater,
+                                    (_, "Unplanned") => std::cmp::Ordering::Less,
+                                    _ => std::cmp::Ordering::Equal,
+                                };
+                                if status_order == std::cmp::Ordering::Equal {
+                                    let date_a =
+                                        NaiveDate::parse_from_str(&a.created_at.date, "%Y-%m-%d")
+                                            .unwrap();
+                                    let date_b =
+                                        NaiveDate::parse_from_str(&b.created_at.date, "%Y-%m-%d")
+                                            .unwrap();
+                                    date_b.cmp(&date_a)
+                                } else {
+                                    status_order
+                                }
+                            });
+                            if let Some(new_index) =
+                                self.jotforms.iter().position(|j| j.id == self.selected_id)
+                            {
+                                self.selected_id = self.jotforms[new_index].id.clone();
+                            }
+                        }
+                    }
+
+                    KeyCode::PageUp => {
+                        self.description_offset = self.description_offset.saturating_sub(1);
+                    }
+                    KeyCode::PageDown => {
+                        self.description_offset = self.description_offset.saturating_add(1);
+                    }
+
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn exit(&mut self) {
+        self.exit = true;
     }
 }
 
 #[tokio::main]
-async fn main() -> Result<(), std::io::Error> {
+async fn main() -> Result<(), Box<dyn Error>> {
+    // Get initial jotforms
+    let jotforms = fetch_jotforms().await?;
+
     let mut terminal = ratatui::init();
-    let app_result = App::default().run(&mut terminal).await;
+    let app_result = App::default().run(&mut terminal, jotforms).await;
     ratatui::restore();
     app_result
 }
